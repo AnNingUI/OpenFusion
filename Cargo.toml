@@ -1,0 +1,24 @@
+[package]
+name = "openfusion"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+directories = "6"
+http = "1"
+imara-diff = "0.2.0"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "webpki-roots", "http2"] }
+rmcp = { version = "1.7", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = { version = "1", features = ["chrono04", "derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = { version = "1", features = ["parse", "display"] }
+tower = { version = "0.5", features = ["limit"] }
+tower-http = { version = "0.7", features = ["cors", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
