@@ -55,7 +55,11 @@ impl SessionStore {
             id: result.session_id.clone(),
             prompt_preview,
             original_prompt,
-            models: result.worker_results.iter().map(|w| w.model.clone()).collect(),
+            models: result
+                .worker_results
+                .iter()
+                .map(|w| w.model.clone())
+                .collect(),
             models_succeeded: result.models_succeeded,
             models_failed: result.models_failed,
             duration_ms: result.duration_ms,
@@ -90,13 +94,19 @@ impl SessionStore {
     }
 
     /// List all sessions, newest first.
-    pub async fn list(&self, query: Option<&str>, limit: Option<usize>) -> Result<Vec<SessionMeta>, OpenFusionError> {
+    pub async fn list(
+        &self,
+        query: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SessionMeta>, OpenFusionError> {
         let index_path = self.dir.join("_index.jsonl");
         if !index_path.exists() {
             return Ok(vec![]);
         }
 
-        let content = tokio::fs::read_to_string(&index_path).await.unwrap_or_default();
+        let content = tokio::fs::read_to_string(&index_path)
+            .await
+            .unwrap_or_default();
         let mut metas: Vec<SessionMeta> = content
             .lines()
             .filter(|l| !l.is_empty())
@@ -108,7 +118,9 @@ impl SessionStore {
             let q = q.to_lowercase();
             metas.retain(|m| {
                 m.prompt_preview.to_lowercase().contains(&q)
-                    || m.models.iter().any(|model| model.to_lowercase().contains(&q))
+                    || m.models
+                        .iter()
+                        .any(|model| model.to_lowercase().contains(&q))
             });
         }
 

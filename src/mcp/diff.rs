@@ -1,6 +1,6 @@
-//! fusion_diff tool: raw model comparison without synthesis.
+//! fusion_diff tool: raw worker comparison without semantic synthesis.
 
-use crate::engine::{Contradiction, ContradictionView, FusionEngine, FusionResult};
+use crate::engine::{FusionEngine, FusionResult};
 use crate::error::OpenFusionError;
 use crate::protocol::{IntermediateRequest, Message, Role};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::sync::Arc;
 pub struct DiffParams {
     pub prompt: String,
     pub system: Option<String>,
-    pub panel_override: Option<String>,
+    pub panel_override: Option<Vec<String>>,
     pub save_session: Option<bool>,
 }
 
@@ -18,120 +18,126 @@ pub struct DiffParams {
 pub struct DiffResult {
     pub session_id: String,
     pub responses: Vec<WorkerResponseView>,
-    pub comparison: DiffComparison,
+    pub summary: DiffSummary,
     pub cost_usd: f64,
     pub duration_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
 pub struct WorkerResponseView {
+    pub name: String,
     pub model: String,
     pub api: String,
     pub content: String,
     pub token_count: u32,
     pub duration_ms: u64,
+    pub cost_usd: f64,
     pub error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct DiffComparison {
-    pub common_points: Vec<String>,
-    pub unique_insights: Vec<ModelInsight>,
-    pub disagreements: Vec<Disagreement>,
-    pub coverage_gaps: Vec<String>,
-    pub best_by_aspect: Vec<AspectRanking>,
+pub struct DiffSummary {
+    pub mode: String,
+    pub note: String,
+    pub models_succeeded: usize,
+    pub models_failed: usize,
 }
 
-#[derive(Debug, Serialize)]
-pub struct ModelInsight {
-    pub model: String,
-    pub insight: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct Disagreement {
-    pub topic: String,
-    pub views: Vec<DisagreementView>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct DisagreementView {
-    pub model: String,
-    pub position: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AspectRanking {
-    pub aspect: String,
-    pub best_model: String,
-    pub reason: String,
-}
-
-pub async fn run(engine: Arc<FusionEngine>, params: DiffParams) -> Result<DiffResult, OpenFusionError> {
-    let mut messages = Vec::new();
-    if let Some(sys) = &params.system {
-        messages.push(Message { role: Role::System, content: sys.clone() });
-    }
-    messages.push(Message { role: Role::User, content: params.prompt.clone() });
-
+pub async fn run(
+    engine: Arc<FusionEngine>,
+    params: DiffParams,
+) -> Result<DiffResult, OpenFusionError> {
+    let prompt = match params
+        .system
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(system) => format!("# Domain Framing\n{system}\n\n# Task\n{}", params.prompt),
+        None => params.prompt.clone(),
+    };
     let request = IntermediateRequest {
-        messages,
+        messages: vec![Message {
+            role: Role::User,
+            content: prompt,
+            tool_call_id: None,
+            tool_is_error: None,
+            tool_calls: vec![],
+        }],
         max_tokens: 2048,
         temperature: Some(0.7),
+        top_p: None,
         stop: vec![],
         api_key: None,
+        tools: Vec::new(),
+        tool_choice: None,
+        parallel_tool_calls: None,
+        thinking: None,
+        session_id: None,
+        stream: false,
+        system: None,
+        metadata: Default::default(),
+        native: Default::default(),
     };
 
     let start = std::time::Instant::now();
-
-    // Apply panel_override: filter workers to only those specified
-    let model_filter: Vec<String> = params.panel_override.as_ref()
-        .map(|s| s.split(',').map(|m| m.trim().to_string()).collect())
-        .unwrap_or_default();
-    let worker_results = engine.execute_workers_filtered(&request, &model_filter).await;
+    let model_filter = params.panel_override.unwrap_or_default();
+    let worker_results = engine
+        .execute_workers_filtered(&request, &model_filter)
+        .await;
+    if worker_results.is_empty() {
+        return Err(OpenFusionError::Config(
+            "No workers matched panel_override".into(),
+        ));
+    }
     let duration_ms = start.elapsed().as_millis() as u64;
     let session_id = uuid::Uuid::new_v4().to_string();
 
-    let responses: Vec<WorkerResponseView> = worker_results.iter().map(|wr| {
-        WorkerResponseView {
-            model: wr.model.clone(),
-            api: wr.api.clone(),
-            content: wr.response.as_ref().map(|r| r.content.clone()).unwrap_or_default(),
-            token_count: wr.response.as_ref().map(|r| r.usage.total_tokens).unwrap_or(0),
-            duration_ms: wr.response.as_ref().map(|r| r.duration_ms).unwrap_or(0),
-            error: wr.error.clone(),
-        }
-    }).collect();
+    let responses = worker_results
+        .iter()
+        .map(|wr| {
+            let response = wr.response.as_ref();
+            WorkerResponseView {
+                name: wr.name.clone(),
+                model: wr.model.clone(),
+                api: wr.api.clone(),
+                content: response.map(|r| r.content.clone()).unwrap_or_default(),
+                token_count: response.map(|r| r.usage.total_tokens).unwrap_or(0),
+                duration_ms: response.map(|r| r.duration_ms).unwrap_or(0),
+                cost_usd: response.map(|r| r.cost_usd).unwrap_or(0.0),
+                error: wr.error.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let total_cost = responses.iter().map(|r| r.cost_usd).sum::<f64>();
+    let models_succeeded = responses.iter().filter(|r| r.error.is_none()).count();
+    let models_failed = responses.len().saturating_sub(models_succeeded);
 
-    let comparison = build_comparison(&responses);
-
-    // Compute total cost from worker responses (must be BEFORE save_session moves worker_results)
-    let total_cost = worker_results.iter()
-        .filter_map(|w| w.response.as_ref().map(|r| r.cost_usd))
-        .sum();
-
-    // Save session if requested
     if params.save_session.unwrap_or(false) {
+        let original_prompt = request
+            .messages
+            .iter()
+            .filter(|message| matches!(message.role, Role::User))
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
         let result = FusionResult {
             session_id: session_id.clone(),
-            synthesis: None,
-            consensus: comparison.common_points.clone(),
-            contradictions: comparison.disagreements.iter().map(|d| Contradiction {
-                topic: d.topic.clone(),
-                views: d.views.iter().map(|v| ContradictionView {
-                    model: v.model.clone(),
-                    position: v.position.clone(),
-                }).collect(),
-            }).collect(),
-            blind_spots: comparison.coverage_gaps.clone(),
+            judge_response: None,
             worker_results,
+            enhanced_prompt_used: false,
+            synthesis: None,
+            consensus: vec![],
+            contradictions: vec![],
+            blind_spots: vec![],
             judge_output_raw: None,
+            passthrough_tool_calls: vec![],
             total_cost_usd: total_cost,
-            models_succeeded: responses.iter().filter(|r| r.error.is_none()).count(),
-            models_failed: responses.iter().filter(|r| r.error.is_some()).count(),
+            models_succeeded,
+            models_failed,
             duration_ms,
             timestamp: chrono::Utc::now().to_rfc3339(),
-            original_prompt: params.prompt.clone(),
+            original_prompt,
         };
         let _ = engine.sessions().save(&result).await;
     }
@@ -139,239 +145,14 @@ pub async fn run(engine: Arc<FusionEngine>, params: DiffParams) -> Result<DiffRe
     Ok(DiffResult {
         session_id,
         responses,
-        comparison,
+        summary: DiffSummary {
+            mode: "raw-worker-comparison".into(),
+            note: "No semantic consensus or disagreement inference is performed. The calling AI client should compare these worker outputs or call fusion with judge_mode=true."
+                .into(),
+            models_succeeded,
+            models_failed,
+        },
         cost_usd: total_cost,
         duration_ms,
     })
-}
-
-fn build_comparison(responses: &[WorkerResponseView]) -> DiffComparison {
-    use imara_diff::{Algorithm, Diff, InternedInput};
-
-    let successful: Vec<&WorkerResponseView> = responses
-        .iter()
-        .filter(|r| r.error.is_none() && !r.content.is_empty())
-        .collect();
-
-    if successful.len() < 2 {
-        let unique_insights: Vec<ModelInsight> = successful
-            .iter()
-            .map(|r| ModelInsight {
-                model: r.model.clone(),
-                insight: r.content.chars().take(300).collect(),
-            })
-            .collect();
-        return DiffComparison {
-            common_points: vec![],
-            unique_insights,
-            disagreements: vec![],
-            coverage_gaps: vec![],
-            best_by_aspect: vec![],
-        };
-    }
-
-    // ── 1. Line-level diffs between every model pair ──
-    struct PairAnalysis {
-        model_a: String,
-        model_b: String,
-        common_lines: Vec<String>,
-        a_only: Vec<String>,
-        b_only: Vec<String>,
-    }
-
-    let mut pair_analyses: Vec<PairAnalysis> = Vec::new();
-    for i in 0..successful.len() {
-        for j in (i + 1)..successful.len() {
-            let input = InternedInput::new(
-                successful[i].content.as_str(),
-                successful[j].content.as_str(),
-            );
-            let mut diff = Diff::compute(Algorithm::Histogram, &input);
-            diff.postprocess_lines(&input);
-
-            let mut common_lines = Vec::new();
-            let mut a_only = Vec::new();
-            let mut b_only = Vec::new();
-
-            // Lines in "before" that are NOT removed → common
-            for (idx, &token) in input.before.iter().enumerate() {
-                let line = input.interner[token].trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if diff.is_removed(idx as u32) {
-                    a_only.push(line.to_string());
-                } else {
-                    common_lines.push(line.to_string());
-                }
-            }
-            // Lines in "after" that ARE added → b_only
-            for (idx, &token) in input.after.iter().enumerate() {
-                let line = input.interner[token].trim();
-                if line.is_empty() {
-                    continue;
-                }
-                if diff.is_added(idx as u32) {
-                    b_only.push(line.to_string());
-                }
-                // Already got common from before side, no need to re-add
-            }
-
-            pair_analyses.push(PairAnalysis {
-                model_a: successful[i].model.clone(),
-                model_b: successful[j].model.clone(),
-                common_lines,
-                a_only,
-                b_only,
-            });
-        }
-    }
-
-    // ── 2. Common points: lines shared by ALL model pairs ──
-    let mut common_points: Vec<String> = Vec::new();
-    if let Some(first_pair) = pair_analyses.first() {
-        'line_loop: for line in &first_pair.common_lines {
-            // Check that all other pairs also have this line in common
-            for pair in &pair_analyses[1..] {
-                if !pair.common_lines.iter().any(|l| {
-                    imara_diff_similarity(l, line) > 0.85
-                }) {
-                    continue 'line_loop;
-                }
-            }
-            let display = truncate(line, 150);
-            if !common_points.contains(&display) {
-                common_points.push(display);
-            }
-        }
-    }
-    common_points.truncate(10);
-
-    // ── 3. Unique insights: lines only in one model, absent from all others ──
-    let mut unique_insights: Vec<ModelInsight> = Vec::new();
-    // Collect per-model unique lines from pair analyses
-    for resp in &successful {
-        let mut model_only: Vec<String> = Vec::new();
-        for pair in &pair_analyses {
-            if pair.model_a == resp.model {
-                model_only.extend(pair.a_only.clone());
-            } else if pair.model_b == resp.model {
-                model_only.extend(pair.b_only.clone());
-            }
-        }
-        // Pick significant unique lines
-        let significant: Vec<String> = model_only
-            .into_iter()
-            .filter(|l| l.len() > 30)
-            .collect::<std::collections::HashSet<_>>()
-            .into_iter()
-            .take(3)
-            .collect();
-        for line in significant {
-            unique_insights.push(ModelInsight {
-                model: resp.model.clone(),
-                insight: truncate(&line, 200),
-            });
-        }
-    }
-
-    // ── 4. Disagreements: modified hunks where models replaced content ──
-    let mut disagreements: Vec<Disagreement> = Vec::new();
-    for pair in &pair_analyses {
-        // When one model has lines the other removed, and vice versa, that's a disagreement
-        if !pair.a_only.is_empty() && !pair.b_only.is_empty() {
-            let topic = extract_topic(&pair.a_only[0]);
-            disagreements.push(Disagreement {
-                topic,
-                views: vec![
-                    DisagreementView {
-                        model: pair.model_a.clone(),
-                        position: truncate(&pair.a_only[0], 250),
-                    },
-                    DisagreementView {
-                        model: pair.model_b.clone(),
-                        position: truncate(&pair.b_only[0], 250),
-                    },
-                ],
-            });
-        }
-    }
-    disagreements.truncate(5);
-
-    // ── 5. Coverage gaps: important themes absent from all responses ──
-    let all_content: String = successful
-        .iter()
-        .map(|r| r.content.to_lowercase())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let question_words = ["why", "how", "risk", "limitation", "caveat", "alternative", "cost", "security", "performance"];
-    let mut coverage_gaps: Vec<String> = Vec::new();
-    for word in &question_words {
-        if !all_content.contains(word) {
-            coverage_gaps.push(format!("No model explicitly addressed '{word}' aspects"));
-        }
-    }
-
-    // ── 6. Best by aspect: use diff stats for ranking ──
-    let mut best_by_aspect: Vec<AspectRanking> = Vec::new();
-    if !successful.is_empty() {
-        let longest = successful.iter().max_by_key(|r| r.content.len()).unwrap();
-        best_by_aspect.push(AspectRanking {
-            aspect: "thoroughness".into(),
-            best_model: longest.model.clone(),
-            reason: format!("Most content ({} lines)", longest.content.lines().count()),
-        });
-        let shortest = successful.iter().min_by_key(|r| r.content.len()).unwrap();
-        best_by_aspect.push(AspectRanking {
-            aspect: "conciseness".into(),
-            best_model: shortest.model.clone(),
-            reason: format!("Most concise ({} lines)", shortest.content.lines().count()),
-        });
-        // Add a "uniqueness" aspect based on diff stats
-        let most_unique = successful.iter().max_by_key(|r| {
-            pair_analyses.iter()
-                .filter(|p| p.model_a == r.model)
-                .map(|p| p.a_only.len())
-                .chain(pair_analyses.iter().filter(|p| p.model_b == r.model).map(|p| p.b_only.len()))
-                .sum::<usize>()
-        }).unwrap();
-        best_by_aspect.push(AspectRanking {
-            aspect: "unique insights".into(),
-            best_model: most_unique.model.clone(),
-            reason: "Most content not found in other models".into(),
-        });
-    }
-
-    DiffComparison {
-        common_points,
-        unique_insights,
-        disagreements,
-        coverage_gaps,
-        best_by_aspect,
-    }
-}
-
-/// Jaccard-based word similarity using HashSet intersection.
-fn imara_diff_similarity(a: &str, b: &str) -> f64 {
-    let words_a: std::collections::HashSet<&str> = a.split_whitespace().collect();
-    let words_b: std::collections::HashSet<&str> = b.split_whitespace().collect();
-    if words_a.is_empty() || words_b.is_empty() {
-        return 0.0;
-    }
-    let intersection = words_a.intersection(&words_b).count();
-    let union = words_a.union(&words_b).count();
-    intersection as f64 / union as f64
-}
-
-fn truncate(s: &str, max_len: usize) -> String {
-    if s.len() > max_len {
-        format!("{}...", &s[..max_len.min(s.len())])
-    } else {
-        s.to_string()
-    }
-}
-
-fn extract_topic(sent: &str) -> String {
-    let topic = sent.split_whitespace().take(5).collect::<Vec<_>>().join(" ");
-    truncate(&topic, 60)
 }

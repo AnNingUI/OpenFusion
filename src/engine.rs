@@ -1,21 +1,11 @@
-//! Fusion engine: parallel worker dispatch + judge synthesis.
-//!
-//! Core flow:
-//!   1. Spawn all workers in parallel (JoinSet)
-//!   2. Collect results, check min_workers threshold
-//!   3. Build judge prompt from successful responses
-//!   4. Judge synthesizes final answer
-//!   5. If judge fails, fall back to raw worker responses
+//! Fusion engine for MCP advisory fanout and optional judge synthesis.
 
 use crate::config::Config;
 use crate::error::OpenFusionError;
-use crate::protocol::{IntermediateRequest, WorkerResult};
+use crate::protocol::{IntermediateRequest, Message, Role, WorkerResult};
 use crate::worker::Worker;
 use std::sync::Arc;
 use std::time::Duration;
-
-pub mod judge;
-pub use judge::{build_judge_prompt, parse_judge_output};
 
 pub mod session;
 pub use session::SessionStore;
@@ -27,22 +17,23 @@ pub struct FusionEngine {
     session_store: Arc<SessionStore>,
 }
 
-/// The result of a single fusion execution.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FusionResult {
     pub session_id: String,
+    pub judge_response: Option<WorkerResult>,
+    pub worker_results: Vec<WorkerResult>,
+    pub enhanced_prompt_used: bool,
     pub synthesis: Option<String>,
     pub consensus: Vec<String>,
     pub contradictions: Vec<Contradiction>,
     pub blind_spots: Vec<String>,
-    pub worker_results: Vec<WorkerResult>,
     pub judge_output_raw: Option<String>,
+    pub passthrough_tool_calls: Vec<crate::protocol::ToolCall>,
     pub total_cost_usd: f64,
     pub models_succeeded: usize,
     pub models_failed: usize,
     pub duration_ms: u64,
     pub timestamp: String,
-    /// Original user prompt text (for session replay)
     pub original_prompt: String,
 }
 
@@ -66,28 +57,22 @@ impl FusionEngine {
 
         let judge_worker = Worker::new(
             config.judge.model.clone(),
-            config.judge.api.clone(),
+            config.judge.api,
             config.judge.base_url.clone(),
             judge_api_key,
-            config.judge.web_search,
-            config.judge.web_fetch,
         );
 
         let mut workers = Vec::new();
         for wcfg in &config.workers {
-            let api_key = config
-                .resolve_api_key(wcfg)
-                .ok_or_else(|| OpenFusionError::Config(format!(
-                    "No API key for worker '{}'", wcfg.model
-                )))?;
-            workers.push(Worker::new(
-                wcfg.model.clone(),
-                wcfg.api.clone(),
-                wcfg.base_url.clone(),
-                api_key,
-                wcfg.web_search,
-                wcfg.web_fetch,
-            ));
+            let api_key = config.resolve_api_key(wcfg).ok_or_else(|| {
+                OpenFusionError::Config(format!("No API key for worker '{}'", wcfg.model))
+            })?;
+            let name = wcfg.name.clone().unwrap_or_else(|| wcfg.model.clone());
+            workers.push(
+                Worker::new(wcfg.model.clone(), wcfg.api, wcfg.base_url.clone(), api_key)
+                    .with_name(name)
+                    .with_advisory_prompt(wcfg.personality.clone()),
+            );
         }
 
         let session_store = Arc::new(SessionStore::new(
@@ -103,81 +88,110 @@ impl FusionEngine {
         })
     }
 
-    /// Execute full fusion: parallel workers → judge synthesis.
-    pub async fn execute(
+    pub async fn execute_advisory(
         &self,
         request: &IntermediateRequest,
+        model_filter: &[String],
+        judge_mode: bool,
+        save_session: bool,
     ) -> Result<FusionResult, OpenFusionError> {
         let start = std::time::Instant::now();
         let session_id = uuid::Uuid::new_v4().to_string();
-
-        // ── Phase 1: Parallel worker dispatch ──
-        let worker_results = self.dispatch_workers(request).await;
-
-        // Extract original user prompt for session replay
         let original_prompt = request
             .messages
             .iter()
-            .filter(|m| matches!(m.role, crate::protocol::Role::User))
+            .filter(|m| matches!(m.role, Role::User))
             .map(|m| m.content.as_str())
             .collect::<Vec<_>>()
             .join("\n");
-        let succeeded: Vec<_> = worker_results.iter().filter(|w| w.success).collect();
-        let failed = worker_results.len() - succeeded.len();
-        let succeeded_count = succeeded.len();
 
-        // Check min_workers threshold
-        if succeeded.len() < self.config.fusion.min_workers {
+        let worker_results = self.execute_workers_filtered(request, model_filter).await;
+        let succeeded_count = worker_results.iter().filter(|w| w.success).count();
+        let failed = worker_results.len().saturating_sub(succeeded_count);
+
+        if succeeded_count < self.config.fusion.min_workers {
+            let failures = worker_results
+                .iter()
+                .filter(|w| !w.success)
+                .map(|w| format!("  {}: {}", w.model, w.error.as_deref().unwrap_or("unknown")))
+                .collect::<Vec<_>>()
+                .join("\n");
             return Err(OpenFusionError::InsufficientWorkers {
-                success_count: succeeded.len(),
+                success_count: succeeded_count,
                 total: worker_results.len(),
                 min: self.config.fusion.min_workers,
+                details: failures,
             });
         }
 
-        // ── Phase 2: Judge synthesis ──
-        let (synthesis, consensus, contradictions, blind_spots, judge_raw) =
-            self.run_judge(request, &succeeded).await;
-
-        let duration_ms = start.elapsed().as_millis() as u64;
-
-        let total_cost_usd: f64 = worker_results.iter()
+        let worker_cost = worker_results
+            .iter()
             .filter_map(|w| w.response.as_ref().map(|r| r.cost_usd))
-            .sum();
+            .sum::<f64>();
+        let mut judge_response = None;
+        let mut judge_output_raw = None;
+        let mut passthrough_tool_calls = Vec::new();
+        let mut total_cost_usd = worker_cost;
+
+        if judge_mode {
+            let mut judge_request = request.clone();
+            if let Some(ctx) = self.build_enhanced_context(&worker_results) {
+                judge_request.messages.insert(
+                    0,
+                    Message {
+                        role: Role::System,
+                        content: format!(
+                            "{ctx}\n\n# Judge Task\nSynthesize the worker proposals into the most concise, highest-signal answer. Keep strong points, discard weak points, call out risks, and avoid pretending to know repository details not present in the task."
+                        ),
+                        tool_call_id: None,
+                        tool_is_error: None,
+                        tool_calls: vec![],
+                    },
+                );
+            }
+            let jr = self.route_to_judge(&judge_request).await?;
+            if let Some(resp) = jr.response.as_ref() {
+                total_cost_usd += resp.cost_usd;
+                judge_output_raw = Some(resp.content.clone());
+                passthrough_tool_calls = resp.tool_calls.clone();
+            }
+            judge_response = Some(jr);
+        }
 
         let result = FusionResult {
-            session_id: session_id.clone(),
-            synthesis,
-            consensus,
-            contradictions,
-            blind_spots,
+            session_id,
+            judge_response,
             worker_results,
-            judge_output_raw: judge_raw,
+            enhanced_prompt_used: judge_mode,
+            synthesis: judge_output_raw.clone(),
+            consensus: vec![],
+            contradictions: vec![],
+            blind_spots: vec![],
+            judge_output_raw,
+            passthrough_tool_calls,
             total_cost_usd,
             models_succeeded: succeeded_count,
             models_failed: failed,
-            duration_ms,
+            duration_ms: start.elapsed().as_millis() as u64,
             timestamp: chrono::Utc::now().to_rfc3339(),
             original_prompt,
         };
 
-        // ── Phase 3: Save session ──
-        let _ = self.session_store.save(&result).await;
+        if save_session {
+            let _ = self.session_store.save(&result).await;
+        }
 
         Ok(result)
     }
 
-    /// Execute workers only — no judge. Used by fusion_diff and fusion_bench.
-    pub async fn execute_workers_only(
-        &self,
-        request: &IntermediateRequest,
-    ) -> Vec<WorkerResult> {
-        self.dispatch_workers(request).await
+    pub async fn execute_workers_only(&self, request: &IntermediateRequest) -> Vec<WorkerResult> {
+        let mut advisory_request = request.clone();
+        advisory_request.tools.clear();
+        advisory_request.tool_choice = None;
+        advisory_request.parallel_tool_calls = None;
+        self.dispatch_workers(&advisory_request).await
     }
 
-    /// Execute only workers whose model names match the filter.
-    /// If filter is empty or contains "all", dispatches all workers.
-    /// If filter contains model names, only those workers are used.
     pub async fn execute_workers_filtered(
         &self,
         request: &IntermediateRequest,
@@ -187,15 +201,97 @@ impl FusionEngine {
         if use_all {
             return self.execute_workers_only(request).await;
         }
-        let filtered: Vec<Worker> = self.workers
+
+        let mut advisory_request = request.clone();
+        advisory_request.tools.clear();
+        advisory_request.tool_choice = None;
+        advisory_request.parallel_tool_calls = None;
+        let filtered = self
+            .workers
             .iter()
-            .filter(|w| model_filter.iter().any(|m| m == &w.model))
+            .filter(|w| model_filter.iter().any(|m| m == &w.model || m == &w.name))
             .cloned()
-            .collect();
-        self.dispatch_specific_workers(&filtered, request).await
+            .collect::<Vec<_>>();
+        self.dispatch_specific_workers(&filtered, &advisory_request)
+            .await
     }
 
-    /// Dispatch a specific set of workers (used for filtered dispatch + judge inclusion).
+    pub fn sessions(&self) -> &Arc<SessionStore> {
+        &self.session_store
+    }
+
+    async fn route_to_judge(
+        &self,
+        request: &IntermediateRequest,
+    ) -> Result<WorkerResult, OpenFusionError> {
+        let max_retries = self
+            .config
+            .fusion
+            .retry
+            .max(crate::error::DEFAULT_TRANSIENT_RETRIES);
+        let mut last_err = None;
+
+        for attempt in 1..=max_retries + 1 {
+            match self
+                .judge_worker
+                .execute(request, self.config.fusion.timeout_secs)
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) if attempt <= max_retries && is_retryable(&e) => {
+                    let delay = retry_delay(&e, attempt);
+                    tracing::warn!(
+                        "Judge attempt {attempt}/{} failed: {e} - retrying in {}ms",
+                        max_retries + 1,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        Err(last_err
+            .unwrap_or_else(|| OpenFusionError::Config("judge retry loop did not run".into())))
+    }
+
+    fn build_enhanced_context(&self, worker_results: &[WorkerResult]) -> Option<String> {
+        let succeeded = worker_results
+            .iter()
+            .filter(|w| w.success)
+            .collect::<Vec<_>>();
+        if succeeded.is_empty() {
+            return None;
+        }
+
+        let mut ctx = String::with_capacity(4096);
+        ctx.push_str("# Worker Proposals\n\n");
+        ctx.push_str(
+            "Multiple AI workers analyzed the task in parallel. Below are their proposals.\n",
+        );
+        ctx.push_str("Use these as reference: absorb strengths, discard weaknesses.\n\n");
+
+        for (i, wr) in succeeded.iter().enumerate() {
+            if let Some(resp) = wr.response.as_ref()
+                && !resp.content.is_empty()
+            {
+                ctx.push_str(&format!(
+                    "## Worker {} ({})\n{}\n\n",
+                    i + 1,
+                    wr.name,
+                    resp.content
+                ));
+            }
+        }
+
+        Some(ctx)
+    }
+
+    async fn dispatch_workers(&self, request: &IntermediateRequest) -> Vec<WorkerResult> {
+        self.dispatch_specific_workers(&self.workers, request).await
+    }
+
     async fn dispatch_specific_workers(
         &self,
         workers: &[Worker],
@@ -205,44 +301,26 @@ impl FusionEngine {
         let timeout = self.config.fusion.worker_timeout_secs;
         let retries = self.config.fusion.retry;
 
-        for worker in workers {
-            let w = worker.clone();
-            let ir = request.clone();
+        for (i, worker) in workers.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            }
+            let worker = worker.clone();
+            let request = request.clone();
+            let model = worker.model.clone();
+            let name = worker.name.clone();
             set.spawn(async move {
-                Self::execute_with_retry(w, ir, timeout, retries).await
-            });
-        }
-
-        Self::collect_join_set(&mut set).await
-    }
-
-    /// Get session store reference for MCP tools.
-    pub fn sessions(&self) -> &Arc<SessionStore> {
-        &self.session_store
-    }
-
-    /// Get workers reference for bench tool.
-    pub fn workers(&self) -> &[Worker] {
-        &self.workers
-    }
-
-    /// Get judge worker reference.
-    pub fn judge(&self) -> &Worker {
-        &self.judge_worker
-    }
-
-    // ── Internal ──
-
-    async fn dispatch_workers(&self, request: &IntermediateRequest) -> Vec<WorkerResult> {
-        let mut set = tokio::task::JoinSet::new();
-        let timeout = self.config.fusion.worker_timeout_secs;
-        let retries = self.config.fusion.retry;
-
-        for worker in &self.workers {
-            let w = worker.clone();
-            let ir = request.clone();
-            set.spawn(async move {
-                Self::execute_with_retry(w, ir, timeout, retries).await
+                match Self::execute_with_retry(worker, request, timeout, retries).await {
+                    Ok(result) => result,
+                    Err(e) => WorkerResult {
+                        model,
+                        name,
+                        api: "error".into(),
+                        success: false,
+                        response: None,
+                        error: Some(e.to_string()),
+                    },
+                }
             });
         }
 
@@ -251,137 +329,69 @@ impl FusionEngine {
 
     async fn execute_with_retry(
         worker: Worker,
-        ir: IntermediateRequest,
+        request: IntermediateRequest,
         timeout: u64,
         retries: u32,
     ) -> Result<WorkerResult, OpenFusionError> {
-        let mut last_err: Option<OpenFusionError> = None;
-        for attempt in 1..=retries + 1 {
-            match worker.execute(&ir, timeout).await {
-                Ok(r) if r.success => return Ok(r),
-                Ok(r) => return Ok(r),
-                Err(e) => {
-                    if attempt <= retries && is_retryable(&e) {
-                        let delay = Duration::from_millis(500 * attempt as u64);
-                        tracing::warn!(
-                            "Worker '{}' attempt {attempt}/{} failed: {e} — retrying in {}ms",
-                            worker.model,
-                            retries + 1,
-                            delay.as_millis()
-                        );
-                        tokio::time::sleep(delay).await;
-                        last_err = Some(e);
-                        continue;
-                    }
-                    return Err(e);
+        let max_retries = retries.max(crate::error::DEFAULT_TRANSIENT_RETRIES);
+        let mut last_err = None;
+
+        for attempt in 1..=max_retries + 1 {
+            match worker.execute(&request, timeout).await {
+                Ok(result) => return Ok(result),
+                Err(e) if attempt <= max_retries && is_retryable(&e) => {
+                    let delay = retry_delay(&e, attempt);
+                    tracing::warn!(
+                        "Worker '{}' attempt {attempt}/{} failed: {e} - retrying in {}ms",
+                        worker.model,
+                        max_retries + 1,
+                        delay.as_millis()
+                    );
+                    tokio::time::sleep(delay).await;
+                    last_err = Some(e);
                 }
+                Err(e) => return Err(e),
             }
         }
-        Err(last_err.unwrap())
+
+        Err(last_err
+            .unwrap_or_else(|| OpenFusionError::Config("worker retry loop did not run".into())))
     }
 
-    async fn collect_join_set(
-        set: &mut tokio::task::JoinSet<Result<crate::protocol::WorkerResult, OpenFusionError>>,
-    ) -> Vec<WorkerResult> {
+    async fn collect_join_set(set: &mut tokio::task::JoinSet<WorkerResult>) -> Vec<WorkerResult> {
         let mut results = Vec::new();
         while let Some(outcome) = set.join_next().await {
             match outcome {
-                Ok(Ok(result)) => results.push(result),
-                Ok(Err(e)) => {
-                    results.push(WorkerResult {
-                        model: "unknown".into(),
-                        api: "unknown".into(),
-                        success: false,
-                        response: None,
-                        error: Some(e.to_string()),
-                    });
-                }
-                Err(join_err) => {
-                    results.push(WorkerResult {
-                        model: "unknown".into(),
-                        api: "unknown".into(),
-                        success: false,
-                        response: None,
-                        error: Some(format!("Worker panicked: {join_err}")),
-                    });
-                }
+                Ok(result) => results.push(result),
+                Err(join_err) => results.push(WorkerResult {
+                    model: "worker-panic".into(),
+                    name: "worker-panic".into(),
+                    api: "unknown".into(),
+                    success: false,
+                    response: None,
+                    error: Some(format!("Worker panicked: {join_err}")),
+                }),
             }
         }
         results
     }
-
-    async fn run_judge(
-        &self,
-        request: &IntermediateRequest,
-        worker_results: &[&WorkerResult],
-    ) -> (
-        Option<String>,
-        Vec<String>,
-        Vec<Contradiction>,
-        Vec<String>,
-        Option<String>,
-    ) {
-        let judge_prompt = build_judge_prompt(request, worker_results);
-
-        let judge_ir = IntermediateRequest {
-            messages: vec![crate::protocol::Message {
-                role: crate::protocol::Role::User,
-                content: judge_prompt,
-            }],
-            max_tokens: 4096,
-            temperature: Some(0.3),
-            stop: vec![],
-            api_key: None,
-        };
-
-        match self.judge_worker.execute(&judge_ir, self.config.fusion.timeout_secs).await {
-            Ok(result) if result.success => {
-                let content = result.response.as_ref()
-                    .map(|r| r.content.clone())
-                    .unwrap_or_default();
-                match parse_judge_output(&content) {
-                    Ok(judge_out) => (
-                        Some(judge_out.synthesis),
-                        judge_out.consensus,
-                        judge_out.contradictions,
-                        judge_out.blind_spots,
-                        Some(content),
-                    ),
-                    Err(_) => (
-                        Some(format!("[Judge parse failed, raw output]\n\n{content}")),
-                        vec![],
-                        vec![],
-                        vec![],
-                        Some(content),
-                    ),
-                }
-            }
-            Ok(_) | Err(_) => {
-                // Degrade: return raw worker concatenation
-                let raw = worker_results.iter()
-                    .filter_map(|w| w.response.as_ref())
-                    .map(|r| format!("## {}\n\n{}", r.model, r.content))
-                    .collect::<Vec<_>>()
-                    .join("\n\n---\n\n");
-                (
-                    Some(format!("[Judge unavailable — raw worker responses]\n\n{raw}")),
-                    vec![],
-                    vec![],
-                    vec![],
-                    None,
-                )
-            }
-        }
-    }
 }
 
-/// Determine whether an error is retryable (5xx server errors, timeouts).
-/// 4xx client errors and parse errors are not retryable.
 fn is_retryable(err: &OpenFusionError) -> bool {
     match err {
-        OpenFusionError::ApiError { status, .. } => *status >= 500,
+        OpenFusionError::ApiError { status, body, .. } => {
+            crate::error::is_transient_upstream_error(*status, body)
+        }
         OpenFusionError::WorkerTimeout { .. } => true,
         OpenFusionError::Network(_) => true,
         _ => false,
     }
+}
+
+fn retry_delay(err: &OpenFusionError, attempt: u32) -> Duration {
+    if let Some(secs) = err.retry_after_secs() {
+        return Duration::from_secs(secs.clamp(1, 10));
+    }
+    let millis = 500_u64.saturating_mul(1_u64 << attempt.saturating_sub(1).min(4));
+    Duration::from_millis(millis.min(8_000))
 }

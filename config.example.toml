@@ -1,15 +1,9 @@
-# OpenFusion Configuration
+# OpenFusion configuration
 # Default location: ~/.openfusion/config.toml
-# Generate by running `openfusion` once — it auto-creates this file.
-
-[server]
-port = 9999
-host = "127.0.0.1"
-max_concurrent_requests = 10
-log_level = "info"
+# OpenFusion runs as an MCP stdio server.
 
 [fusion]
-name = "openrouter/fusion"
+name = "openfusion/fusion"
 timeout_secs = 120
 worker_timeout_secs = 60
 min_workers = 1
@@ -17,29 +11,25 @@ retry = 0
 
 [judge]
 base_url = "https://api.openai.com"
-api = "openai-completions"
+api = "openai-responses"
 api_key = "sk-xxx"
-model = "deepseek-v4-pro"
-# system_prompt = "You are an expert synthesis judge..."
+model = "gpt-5.4-mini"
 
 [[workers]]
 base_url = "https://api.openai.com"
 api = "openai-responses"
 api_key = "sk-xxx"
-model = "gpt-5.5"
-
-[[workers]]
-base_url = "https://generativelanguage.googleapis.com"
-api = "google-generative-ai"
-api_key = "sk-xxx"
-model = "gemini-3.5-flash"
+model = "gpt-5.4-mini"
+name = "analytical"
+personality = ["rational", "logical"]
 
 [[workers]]
 base_url = "https://api.anthropic.com"
 api = "anthropic-messages"
 api_key = "sk-xxx"
 model = "claude-sonnet-4.6"
+name = "critical"
+personality = ["strict", "critical"]
 
 [storage]
-# sessions_dir = "~/.openfusion/sessions"
 max_sessions = 1000
